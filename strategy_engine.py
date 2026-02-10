@@ -203,6 +203,19 @@ class LadderEngine:
 
         # Optional mover-diagnostics throttle (file/log spam guard)
         self._last_movers_diag_ts = 0.0
+
+        # Background mover selection (keep tick hot path minimal)
+        self._mover_selector_stop = threading.Event()
+        self._mover_selector_thread: threading.Thread | None = None
+        self._mover_select_lock = threading.Lock()
+
+        # Tick-latency sampling (avoid per-tick timer overhead in ultra-low latency mode)
+        try:
+            self._tick_latency_sample_every = int(os.getenv("TICK_LATENCY_SAMPLE_EVERY", "20") or 20)
+        except Exception:
+            self._tick_latency_sample_every = 20
+        self._tick_latency_sample_every = max(1, int(self._tick_latency_sample_every))
+        self._tick_latency_counter = 0
         
         # Cache for performance
         self.filtered_stocks_cache = None
@@ -218,6 +231,17 @@ class LadderEngine:
         self._pending_start_symbols: set[str] = set()
         self._order_generation = 0
         self._ensure_order_workers()
+
+        # Order update (websocket) reconciliation: order_id -> action dict
+        self._pending_broker_actions: dict[str, dict] = {}
+        self._pending_broker_actions_lock = threading.Lock()
+
+        # Subscribe to Dhan Live Order Updates (if wrapper supports it)
+        try:
+            if hasattr(self.dhan_client, "set_order_update_callback"):
+                self.dhan_client.set_order_update_callback(self.on_order_update)
+        except Exception:
+            pass
         
         # Pre-calculate multipliers
         self._update_multipliers()
@@ -278,6 +302,56 @@ class LadderEngine:
                     self._order_queue.task_done()
                 except Exception:
                     pass
+
+    def _start_mover_selector(self):
+        if self._mover_selector_thread and self._mover_selector_thread.is_alive():
+            return
+        self._mover_selector_stop.clear()
+        t = threading.Thread(
+            target=self._mover_selector_loop,
+            name="mover-selector",
+            daemon=True,
+        )
+        t.start()
+        self._mover_selector_thread = t
+
+    def _stop_mover_selector(self):
+        self._mover_selector_stop.set()
+        t = self._mover_selector_thread
+        if t and t.is_alive():
+            try:
+                t.join(timeout=0.2)
+            except Exception:
+                pass
+        self._mover_selector_thread = None
+
+    def _mover_selector_loop(self):
+        import time as _time
+
+        while not self._mover_selector_stop.is_set():
+            if not self.running:
+                _time.sleep(0.2)
+                continue
+            if self.trading_halted:
+                _time.sleep(0.5)
+                continue
+            if not self.is_market_hours():
+                _time.sleep(2.0)
+                continue
+
+            if not self._mover_select_lock.acquire(blocking=False):
+                _time.sleep(self._select_interval_seconds)
+                continue
+            try:
+                self.select_top_movers()
+            except Exception as e:
+                logger.error(f"Mover selector error: {e}", exc_info=True)
+            finally:
+                try:
+                    self._mover_select_lock.release()
+                except Exception:
+                    pass
+            _time.sleep(self._select_interval_seconds)
 
     def _enqueue_order(self, task: dict) -> bool:
         try:
@@ -455,7 +529,6 @@ class LadderEngine:
                 order_type="MARKET",
             )
 
-        pos_before = self._get_broker_position_snapshot(symbol)
         start_time = time.time()
         resp = self.dhan_client.place_order(
             symbol=symbol,
@@ -484,24 +557,29 @@ class LadderEngine:
             return resp, None, 0.0, 0
 
         order_id = None
-        executed_price = float(price or 0.0)
-        executed_qty = int(qty or 0)
         if resp:
-            fallback_id = order.order_id if order else f"TEMP_{symbol}_{int(time.time() * 1000)}"
-            order_id = str(resp.get("orderId", fallback_id))
-            inferred = self._wait_for_broker_fill(symbol, transaction_type, pos_before, qty_hint=qty)
-            if inferred:
-                executed_price, executed_qty = float(inferred[0]), int(inferred[1])
-            with self._order_manager_lock:
-                if order:
-                    self.order_manager.replace_order_id(order.order_id, order_id)
-                    self.order_manager.update_order_status(
-                        order_id,
-                        "EXECUTED",
-                        executed_price=executed_price,
-                        executed_quantity=executed_qty,
-                    )
-        return resp, order_id, executed_price, executed_qty
+            try:
+                order_id_val = (
+                    resp.get("orderId")
+                    or resp.get("order_id")
+                    or (resp.get("data") or {}).get("orderId")
+                    or (resp.get("data") or {}).get("order_id")
+                )
+            except Exception:
+                order_id_val = None
+
+            if order_id_val:
+                order_id = str(order_id_val)
+                with self._order_manager_lock:
+                    if order:
+                        self.order_manager.replace_order_id(order.order_id, order_id)
+                        self.order_manager.update_order_status(
+                            order_id,
+                            "PENDING",
+                            executed_price=0.0,
+                            executed_quantity=0,
+                        )
+        return resp, order_id, 0.0, 0
 
     def _execute_order_task(self, task: dict):
         kind = task.get("kind")
@@ -536,7 +614,7 @@ class LadderEngine:
         if kind == "START_LONG":
             qty = int(task.get("qty") or 0)
             price = float(task.get("price") or 0.0)
-            resp, order_id, exec_price, exec_qty = self._place_market_order(symbol, "BUY", qty, price)
+            resp, order_id, _, _ = self._place_market_order(symbol, "BUY", qty, price)
             with lock:
                 stock = self.active_stocks.get(symbol)
                 if not stock or stock.pending_order != expected_pending:
@@ -549,33 +627,31 @@ class LadderEngine:
                         self._pending_start_symbols.discard(symbol)
                     return
 
-                with self._started_lock:
-                    self._pending_start_symbols.discard(symbol)
-                    self.started_symbols.add(symbol)
-
                 if order_id:
                     stock.order_ids.append(str(order_id))
+                    with self._pending_broker_actions_lock:
+                        self._pending_broker_actions[str(order_id)] = {
+                            "kind": "START_LONG",
+                            "symbol": symbol,
+                            "pending": expected_pending,
+                            "qty": qty,
+                            "price": price,
+                        }
+                    # Keep stock pending until we receive TRADED via order-update websocket.
+                    return
 
-                fill_price = float(exec_price or price or 0.0)
-                fill_qty = int(exec_qty or qty or 0)
-                stock.mode = "LONG"
-                stock.status = "ACTIVE"
-                stock.ladder_level = 1
-                stock.entry_price = fill_price
-                stock.avg_entry_price = fill_price
-                stock.quantity = fill_qty
-                stock.high_watermark = fill_price
-
-                stock.stop_loss = fill_price * (1 - self.init_sl_mult)
-                stock.target = fill_price * (1 + self.target_mult)
-                stock.next_add_on = fill_price * (1 + self.add_on_mult)
+                stock.last_order_error = "Order placed but missing orderId"
+                stock.status = "IDLE"
                 self._clear_pending(stock)
+                with self._started_lock:
+                    self._pending_start_symbols.discard(symbol)
+                return
             return
 
         if kind == "START_SHORT":
             qty = int(task.get("qty") or 0)
             price = float(task.get("price") or 0.0)
-            resp, order_id, exec_price, exec_qty = self._place_market_order(symbol, "SELL", qty, price)
+            resp, order_id, _, _ = self._place_market_order(symbol, "SELL", qty, price)
             with lock:
                 stock = self.active_stocks.get(symbol)
                 if not stock or stock.pending_order != expected_pending:
@@ -588,27 +664,24 @@ class LadderEngine:
                         self._pending_start_symbols.discard(symbol)
                     return
 
-                with self._started_lock:
-                    self._pending_start_symbols.discard(symbol)
-                    self.started_symbols.add(symbol)
-
                 if order_id:
                     stock.order_ids.append(str(order_id))
+                    with self._pending_broker_actions_lock:
+                        self._pending_broker_actions[str(order_id)] = {
+                            "kind": "START_SHORT",
+                            "symbol": symbol,
+                            "pending": expected_pending,
+                            "qty": qty,
+                            "price": price,
+                        }
+                    return
 
-                fill_price = float(exec_price or price or 0.0)
-                fill_qty = int(exec_qty or qty or 0)
-                stock.mode = "SHORT"
-                stock.status = "ACTIVE"
-                stock.ladder_level = 1
-                stock.entry_price = fill_price
-                stock.avg_entry_price = fill_price
-                stock.quantity = fill_qty
-                stock.high_watermark = fill_price
-
-                stock.stop_loss = fill_price * (1 + self.init_sl_mult)
-                stock.target = fill_price * (1 - self.target_mult)
-                stock.next_add_on = fill_price * (1 - self.add_on_mult)
+                stock.last_order_error = "Order placed but missing orderId"
+                stock.status = "IDLE"
                 self._clear_pending(stock)
+                with self._started_lock:
+                    self._pending_start_symbols.discard(symbol)
+                return
             return
 
         if kind == "ADD_ON":
@@ -616,7 +689,7 @@ class LadderEngine:
             qty = int(task.get("qty") or 0)
             price = float(task.get("price") or 0.0)
             transaction_type = "BUY" if mode == "LONG" else "SELL"
-            resp, order_id, exec_price, exec_qty = self._place_market_order(symbol, transaction_type, qty, price)
+            resp, order_id, _, _ = self._place_market_order(symbol, transaction_type, qty, price)
             with lock:
                 stock = self.active_stocks.get(symbol)
                 if not stock or stock.pending_order != expected_pending:
@@ -628,35 +701,20 @@ class LadderEngine:
 
                 if order_id:
                     stock.order_ids.append(str(order_id))
+                    with self._pending_broker_actions_lock:
+                        self._pending_broker_actions[str(order_id)] = {
+                            "kind": "ADD_ON",
+                            "symbol": symbol,
+                            "pending": expected_pending,
+                            "mode": mode,
+                            "qty": qty,
+                            "price": price,
+                        }
+                    return
 
-                fill_price = float(exec_price or price or 0.0)
-                fill_qty = int(exec_qty or qty or 0)
-                prev_qty = stock.quantity
-                stock.quantity += fill_qty
-                stock.ladder_level += 1 if fill_qty > 0 else 0
-
-                if prev_qty > 0 and stock.avg_entry_price > 0:
-                    stock.avg_entry_price = (
-                        (stock.avg_entry_price * prev_qty) + (fill_price * fill_qty)
-                    ) / stock.quantity
-                else:
-                    stock.avg_entry_price = fill_price
-
-                if mode == "LONG":
-                    stock.next_add_on = fill_price * (1 + self.add_on_mult)
-                    # Keep SL/target aligned to executed (avg) price; never loosen SL.
-                    init_sl = stock.avg_entry_price * (1 - self.init_sl_mult)
-                    if init_sl > stock.stop_loss:
-                        stock.stop_loss = init_sl
-                    stock.target = stock.avg_entry_price * (1 + self.target_mult)
-                else:
-                    stock.next_add_on = fill_price * (1 - self.add_on_mult)
-                    init_sl = stock.avg_entry_price * (1 + self.init_sl_mult)
-                    if stock.stop_loss == 0 or init_sl < stock.stop_loss:
-                        stock.stop_loss = init_sl
-                    stock.target = stock.avg_entry_price * (1 - self.target_mult)
-
+                stock.last_order_error = "Order placed but missing orderId"
                 self._clear_pending(stock)
+                return
             return
 
         if kind == "CLOSE":
@@ -677,11 +735,21 @@ class LadderEngine:
 
                 if order_id:
                     stock.order_ids.append(str(order_id))
+                    with self._pending_broker_actions_lock:
+                        self._pending_broker_actions[str(order_id)] = {
+                            "kind": "CLOSE",
+                            "symbol": symbol,
+                            "pending": expected_pending,
+                            "qty": qty,
+                            "price": price,
+                            "final_status": final_status,
+                        }
+                    return
 
-                stock.quantity = 0
-                stock.mode = "NONE"
-                stock.status = final_status
+                stock.last_order_error = "Order placed but missing orderId"
+                stock.status = "ACTIVE"
                 self._clear_pending(stock)
+                return
             return
 
         if kind == "CLOSE_AND_FLIP":
@@ -696,7 +764,7 @@ class LadderEngine:
             if reverse_qty <= 0:
                 reverse_qty = close_qty + max(0, open_qty)
 
-            resp_rev, order_id_rev, exec_price, exec_qty = self._place_market_order(
+            resp_rev, order_id_rev, _, _ = self._place_market_order(
                 symbol, reverse_tx, reverse_qty, price
             )
             with lock:
@@ -712,47 +780,25 @@ class LadderEngine:
 
                 if order_id_rev:
                     stock.order_ids.append(str(order_id_rev))
-
-                # Start new ladder in opposite direction (level resets)
-                with self._started_lock:
-                    self.started_symbols.add(symbol)
-
-                fill_price = float(exec_price or price or 0.0)
-                filled_total = int(exec_qty or reverse_qty or 0)
-                filled_open_qty = max(0, filled_total - max(0, close_qty))
-
-                # If we couldn't open the next ladder, keep best-effort stable state.
-                if filled_open_qty <= 0:
-                    stock.last_order_error = "Flip executed without opening new ladder quantity"
-                    stock.quantity = 0
-                    stock.mode = "NONE"
-                    stock.status = "IDLE"
-                    self._clear_pending(stock)
+                    with self._pending_broker_actions_lock:
+                        self._pending_broker_actions[str(order_id_rev)] = {
+                            "kind": "CLOSE_AND_FLIP",
+                            "symbol": symbol,
+                            "pending": expected_pending,
+                            "flip_to": flip_to,
+                            "close_qty": close_qty,
+                            "open_qty": open_qty,
+                            "reverse_qty": reverse_qty,
+                            "qty": reverse_qty,
+                            "price": price,
+                            "cycle_index_next": cycle_index_next,
+                        }
                     return
 
-                if flip_to == "SHORT":
-                    stock.mode = "SHORT"
-                    stock.stop_loss = fill_price * (1 + self.init_sl_mult)
-                    stock.target = fill_price * (1 - self.target_mult)
-                    stock.next_add_on = fill_price * (1 - self.add_on_mult)
-                else:
-                    stock.mode = "LONG"
-                    stock.stop_loss = fill_price * (1 - self.init_sl_mult)
-                    stock.target = fill_price * (1 + self.target_mult)
-                    stock.next_add_on = fill_price * (1 + self.add_on_mult)
-
+                stock.last_order_error = "Order placed but missing orderId"
                 stock.status = "ACTIVE"
-                stock.ladder_level = 1
-                stock.entry_price = fill_price
-                stock.avg_entry_price = fill_price
-                stock.quantity = filled_open_qty
-                stock.high_watermark = fill_price
-                if cycle_index_next is not None:
-                    try:
-                        stock.cycle_index = int(cycle_index_next)
-                    except Exception:
-                        pass
                 self._clear_pending(stock)
+                return
             return
 
     def _update_multipliers(self):
@@ -777,6 +823,9 @@ class LadderEngine:
         """Stop strategy and cancel queued (not-yet-executed) orders."""
         self.running = False
         self.armed_for_market_open = False
+        self._stop_mover_selector()
+        with self._pending_broker_actions_lock:
+            self._pending_broker_actions.clear()
         self._order_generation += 1
         with self._started_lock:
             self._pending_start_symbols.clear()
@@ -800,6 +849,281 @@ class LadderEngine:
                 if s.status.startswith("PENDING"):
                     # Revert to best-effort stable state
                     s.status = "ACTIVE" if s.mode != "NONE" else "IDLE"
+
+    @staticmethod
+    def _ou_pick(d: dict, *keys: str, default=None):
+        for k in keys:
+            if k in d and d.get(k) is not None:
+                return d.get(k)
+        return default
+
+    def on_order_update(self, payload: dict):
+        """
+        Handle Dhan Live Order Update WebSocket messages.
+        Expected shape (best-effort): {"Type":"order_alert","Data":{...}}.
+        """
+        try:
+            if not isinstance(payload, dict):
+                return
+            msg_type = str(payload.get("Type") or payload.get("type") or "").strip().lower()
+            if msg_type and msg_type != "order_alert":
+                return
+            data = payload.get("Data") or payload.get("data") or {}
+            if not isinstance(data, dict):
+                return
+
+            order_id = self._ou_pick(data, "OrderNo", "orderNo", "order_id", "orderId")
+            if order_id is None:
+                return
+            order_id = str(order_id)
+
+            status_raw = self._ou_pick(data, "Status", "status", default="")
+            status = str(status_raw or "").strip().upper()
+
+            traded_qty = self._ou_pick(data, "TradedQty", "tradedQty", "traded_qty")
+            avg_price = self._ou_pick(data, "AvgTradedPrice", "avgTradedPrice", "avg_traded_price")
+            traded_price = self._ou_pick(data, "TradedPrice", "tradedPrice", "traded_price")
+            reason = self._ou_pick(data, "ReasonDescription", "reasonDescription", "reason", "remarks", default="")
+
+            try:
+                traded_qty_i = int(float(traded_qty)) if traded_qty is not None else 0
+            except Exception:
+                traded_qty_i = 0
+            try:
+                avg_price_f = float(avg_price) if avg_price is not None else 0.0
+            except Exception:
+                avg_price_f = 0.0
+            try:
+                traded_price_f = float(traded_price) if traded_price is not None else 0.0
+            except Exception:
+                traded_price_f = 0.0
+
+            # Update OrderManager record (if we have it)
+            with self._order_manager_lock:
+                if order_id in self.order_manager.orders:
+                    if status == "TRADED":
+                        self.order_manager.update_order_status(
+                            order_id,
+                            "EXECUTED",
+                            executed_price=(avg_price_f or traded_price_f or 0.0),
+                            executed_quantity=traded_qty_i,
+                        )
+                    elif status in {"REJECTED"}:
+                        self.order_manager.update_order_status(
+                            order_id,
+                            "REJECTED",
+                            executed_price=0.0,
+                            executed_quantity=traded_qty_i,
+                            error_message=str(reason),
+                        )
+                    elif status in {"CANCELLED", "EXPIRED"}:
+                        self.order_manager.update_order_status(
+                            order_id,
+                            "CANCELLED",
+                            executed_price=0.0,
+                            executed_quantity=traded_qty_i,
+                            error_message=str(reason),
+                        )
+                    else:
+                        self.order_manager.update_order_status(
+                            order_id,
+                            "PENDING",
+                            executed_price=0.0,
+                            executed_quantity=traded_qty_i,
+                            error_message="",
+                        )
+
+            # Apply engine-side action only when traded (full fill assumed for MARKET orders).
+            if status != "TRADED":
+                # If rejected/cancelled, unwind pending action immediately.
+                if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
+                    self._handle_broker_action_failure(order_id, str(reason))
+                return
+
+            fill_price = float(avg_price_f or traded_price_f or 0.0)
+            if fill_price <= 0:
+                fill_price = 0.0
+
+            self._apply_broker_fill(order_id, fill_price, traded_qty_i)
+        except Exception as e:
+            logger.error(f"Order update handler failed: {e}", exc_info=True)
+
+    def _handle_broker_action_failure(self, order_id: str, error_message: str):
+        with self._pending_broker_actions_lock:
+            action = self._pending_broker_actions.pop(str(order_id), None)
+        if not action:
+            return
+
+        symbol = action.get("symbol")
+        expected_pending = action.get("pending")
+        kind = action.get("kind")
+
+        if not symbol or symbol not in self.active_stocks:
+            return
+
+        lock = self._get_stock_lock(symbol)
+        with lock:
+            stock = self.active_stocks.get(symbol)
+            if not stock or (expected_pending and stock.pending_order != expected_pending):
+                return
+            stock.last_order_error = error_message or "Order failed"
+            if kind in ("START_LONG", "START_SHORT"):
+                stock.status = "IDLE"
+                self._clear_pending(stock)
+                with self._started_lock:
+                    self._pending_start_symbols.discard(symbol)
+            elif kind in ("CLOSE", "CLOSE_AND_FLIP"):
+                stock.status = "ACTIVE"
+                self._clear_pending(stock)
+            else:
+                self._clear_pending(stock)
+
+    def _apply_broker_fill(self, order_id: str, fill_price: float, fill_qty: int):
+        with self._pending_broker_actions_lock:
+            action = self._pending_broker_actions.pop(str(order_id), None)
+        if not action:
+            return
+
+        kind = action.get("kind")
+        symbol = action.get("symbol")
+        expected_pending = action.get("pending")
+        if not symbol or symbol not in self.active_stocks:
+            return
+
+        if fill_qty <= 0:
+            fill_qty = int(action.get("qty") or 0)
+        if fill_price <= 0:
+            try:
+                fill_price = float(action.get("price") or 0.0)
+            except Exception:
+                fill_price = 0.0
+
+        lock = self._get_stock_lock(symbol)
+        with lock:
+            stock = self.active_stocks.get(symbol)
+            if not stock or (expected_pending and stock.pending_order != expected_pending):
+                return
+
+            # Ensure order id is recorded
+            if order_id and str(order_id) not in stock.order_ids:
+                stock.order_ids.append(str(order_id))
+
+            if kind == "START_LONG":
+                stock.mode = "LONG"
+                stock.status = "ACTIVE"
+                stock.ladder_level = 1
+                stock.entry_price = fill_price
+                stock.avg_entry_price = fill_price
+                stock.quantity = int(fill_qty)
+                stock.high_watermark = fill_price
+
+                stock.stop_loss = fill_price * (1 - self.init_sl_mult)
+                stock.target = fill_price * (1 + self.target_mult)
+                stock.next_add_on = fill_price * (1 + self.add_on_mult)
+                self._clear_pending(stock)
+                with self._started_lock:
+                    self._pending_start_symbols.discard(symbol)
+                    self.started_symbols.add(symbol)
+                return
+
+            if kind == "START_SHORT":
+                stock.mode = "SHORT"
+                stock.status = "ACTIVE"
+                stock.ladder_level = 1
+                stock.entry_price = fill_price
+                stock.avg_entry_price = fill_price
+                stock.quantity = int(fill_qty)
+                stock.high_watermark = fill_price
+
+                stock.stop_loss = fill_price * (1 + self.init_sl_mult)
+                stock.target = fill_price * (1 - self.target_mult)
+                stock.next_add_on = fill_price * (1 - self.add_on_mult)
+                self._clear_pending(stock)
+                with self._started_lock:
+                    self._pending_start_symbols.discard(symbol)
+                    self.started_symbols.add(symbol)
+                return
+
+            if kind == "ADD_ON":
+                mode = action.get("mode")
+                prev_qty = int(stock.quantity or 0)
+                fill_qty_i = int(fill_qty or 0)
+                if fill_qty_i > 0:
+                    stock.quantity = prev_qty + fill_qty_i
+                    stock.ladder_level += 1
+                    if prev_qty > 0 and stock.avg_entry_price > 0:
+                        stock.avg_entry_price = (
+                            (stock.avg_entry_price * prev_qty) + (fill_price * fill_qty_i)
+                        ) / float(stock.quantity)
+                    else:
+                        stock.avg_entry_price = fill_price
+
+                if mode == "LONG":
+                    stock.next_add_on = fill_price * (1 + self.add_on_mult)
+                    init_sl = stock.avg_entry_price * (1 - self.init_sl_mult)
+                    if init_sl > stock.stop_loss:
+                        stock.stop_loss = init_sl
+                    stock.target = stock.avg_entry_price * (1 + self.target_mult)
+                else:
+                    stock.next_add_on = fill_price * (1 - self.add_on_mult)
+                    init_sl = stock.avg_entry_price * (1 + self.init_sl_mult)
+                    if stock.stop_loss == 0 or init_sl < stock.stop_loss:
+                        stock.stop_loss = init_sl
+                    stock.target = stock.avg_entry_price * (1 - self.target_mult)
+
+                self._clear_pending(stock)
+                return
+
+            if kind == "CLOSE":
+                final_status = action.get("final_status") or "CLOSED"
+                stock.quantity = 0
+                stock.mode = "NONE"
+                stock.status = final_status
+                self._clear_pending(stock)
+                return
+
+            if kind == "CLOSE_AND_FLIP":
+                flip_to = action.get("flip_to")
+                close_qty = int(action.get("close_qty") or 0)
+                cycle_index_next = action.get("cycle_index_next")
+
+                filled_total = int(fill_qty or 0)
+                filled_open_qty = max(0, filled_total - max(0, close_qty))
+                if filled_open_qty <= 0:
+                    stock.last_order_error = "Flip executed without opening new ladder quantity"
+                    stock.quantity = 0
+                    stock.mode = "NONE"
+                    stock.status = "IDLE"
+                    self._clear_pending(stock)
+                    return
+
+                with self._started_lock:
+                    self.started_symbols.add(symbol)
+
+                if flip_to == "SHORT":
+                    stock.mode = "SHORT"
+                    stock.stop_loss = fill_price * (1 + self.init_sl_mult)
+                    stock.target = fill_price * (1 - self.target_mult)
+                    stock.next_add_on = fill_price * (1 - self.add_on_mult)
+                else:
+                    stock.mode = "LONG"
+                    stock.stop_loss = fill_price * (1 - self.init_sl_mult)
+                    stock.target = fill_price * (1 + self.target_mult)
+                    stock.next_add_on = fill_price * (1 + self.add_on_mult)
+
+                stock.status = "ACTIVE"
+                stock.ladder_level = 1
+                stock.entry_price = fill_price
+                stock.avg_entry_price = fill_price
+                stock.quantity = filled_open_qty
+                stock.high_watermark = fill_price
+                if cycle_index_next is not None:
+                    try:
+                        stock.cycle_index = int(cycle_index_next)
+                    except Exception:
+                        pass
+                self._clear_pending(stock)
+                return
 
     def _normalize_settings(self, settings: StrategySettings) -> StrategySettings:
         """Clamp/adjust settings to avoid invalid combinations from UI."""
@@ -826,7 +1150,9 @@ class LadderEngine:
         max_ladders = max(1, max_ladders)
         top_gainers = max(0, top_gainers)
         top_losers = max(0, top_losers)
-        max_concurrent_orders = max(1, max_concurrent_orders)
+        # Latency: keep order execution concurrency high to avoid queue backlogs.
+        # Force to 10 as requested (UI values will be normalized).
+        max_concurrent_orders = 10
 
         try:
             cycles_per_stock = int(getattr(settings, "cycles_per_stock", 3) or 3)
@@ -1068,7 +1394,7 @@ class LadderEngine:
         
         # Subscribe to WebSocket
         self.dhan_client.subscribe(candidates, self.process_tick)
-        
+         
         # Initialize stocks in tracking dict
         for symbol in candidates:
             self.active_stocks[symbol] = StockStatus(
@@ -1085,8 +1411,11 @@ class LadderEngine:
                 stop_loss=0.0,
                 target=0.0,
                 prev_close=candidates_map[symbol],
-                high_watermark=0.0
-            )
+                 high_watermark=0.0
+             )
+
+        # Background mover selection (avoid doing ranking work on the tick callback thread).
+        self._start_mover_selector()
 
         # Main loop
         while self.running:
@@ -1128,12 +1457,11 @@ class LadderEngine:
                 await self.square_off_all()
                 # Stop feed to avoid reconnect storms after market close
                 self.dhan_client.stop_feed()
+                self._stop_mover_selector()
                 self.running = False
 
     def process_tick(self, symbol: str, ltp: float, volume: float = 0.0):
         """Process incoming tick data with performance tracking."""
-        start_time = time.time()
-        
         if not self.running or symbol not in self.active_stocks:
             return
 
@@ -1142,6 +1470,14 @@ class LadderEngine:
         if not lock.acquire(blocking=False):
             return
         try:
+            do_sample = False
+            sample_start = 0.0
+            if perf_monitor.enabled:
+                self._tick_latency_counter += 1
+                if (self._tick_latency_counter % self._tick_latency_sample_every) == 0:
+                    do_sample = True
+                    sample_start = time.perf_counter()
+
             stock = self.active_stocks[symbol]
 
             if stock.status == "STOPPED" or stock.status.startswith("CLOSED"):
@@ -1180,14 +1516,10 @@ class LadderEngine:
 
             # If trading is halted, don't take any new actions (but keep updating UI fields).
             if self.trading_halted:
-                latency_ms = (time.time() - start_time) * 1000
-                perf_monitor.record_tick_latency(latency_ms)
                 return
 
             # If an order is in-flight for this stock, don't trigger new actions.
             if getattr(stock, "pending_order", ""):
-                latency_ms = (time.time() - start_time) * 1000
-                perf_monitor.record_tick_latency(latency_ms)
                 return
 
             # Trading Logic
@@ -1212,12 +1544,9 @@ class LadderEngine:
             elif loss_limit > 0 and stock.pnl <= -loss_limit:
                 self.close_position(stock, "Stock loss limit reached", final_status="CLOSED_STOCK_LOSS_LIMIT")
 
-            # Reactive mover selection (throttled)
-            self._maybe_select_top_movers()
-
-            # Record performance
-            latency_ms = (time.time() - start_time) * 1000
-            perf_monitor.record_tick_latency(latency_ms)
+            # Record sampled tick-latency (avoid per-tick timer overhead).
+            if do_sample:
+                perf_monitor.record_tick_latency((time.perf_counter() - sample_start) * 1000)
         finally:
             try:
                 lock.release()
@@ -1376,7 +1705,7 @@ class LadderEngine:
                 "price": float(stock.ltp),
             }
 
-        logger.info(f"Queued ADD-ON for {symbol} ({mode}) Qty: {qty}")
+        logger.debug("Queued ADD-ON for %s (%s) qty=%s", symbol, mode, qty)
         if not self._enqueue_order(task):
             with lock:
                 stock.last_order_error = "Order queue full"
@@ -1529,12 +1858,15 @@ class LadderEngine:
 
     def select_top_movers(self):
         """Rank stocks and activate ladders for top movers."""
+        import heapq
         min_turnover = self.settings.min_turnover_crores * 10000000
 
-        logger.info(
-            f"Selecting movers: min_turnover={self.settings.min_turnover_crores:.2f} Cr "
-            f"({min_turnover:.0f})"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Selecting movers: min_turnover=%.2f Cr (%.0f)",
+                float(self.settings.min_turnover_crores),
+                float(min_turnover),
+            )
         
         active_longs = 0
         active_shorts = 0
@@ -1560,15 +1892,18 @@ class LadderEngine:
             started_or_pending = len(self.started_symbols) + len(self._pending_start_symbols)
 
         if started_or_pending >= max_ladders:
-            logger.info(
-                f"Max ladder stocks reached for session ({started_or_pending}/{max_ladders}) "
-                f"- not starting new symbols"
+            logger.debug(
+                "Max ladder stocks reached for session (%s/%s) - not starting new symbols",
+                started_or_pending,
+                max_ladders,
             )
             return
 
         if active_total >= max_ladders:
-            logger.info(
-                f"Max ladder stocks reached ({active_total}/{max_ladders}) - not starting new ladders"
+            logger.debug(
+                "Max ladder stocks reached (%s/%s) - not starting new ladders",
+                active_total,
+                max_ladders,
             )
             return
 
@@ -1583,25 +1918,33 @@ class LadderEngine:
             need_shorts = min(need_shorts, max(0, remaining_capacity - need_longs))
 
         if need_longs <= 0 and need_shorts <= 0:
-            logger.info(
-                f"No new ladders needed (active_longs={active_longs}/{self.settings.top_n_gainers}, "
-                f"active_shorts={active_shorts}/{self.settings.top_n_losers}, "
-                f"max={max_ladders})"
+            logger.debug(
+                "No new ladders needed (active_longs=%s/%s, active_shorts=%s/%s, max=%s)",
+                active_longs,
+                int(self.settings.top_n_gainers or 0),
+                active_shorts,
+                int(self.settings.top_n_losers or 0),
+                max_ladders,
             )
             return
 
+        debug = logger.isEnabledFor(logging.DEBUG)
         idle_stocks = []
         for s in self.active_stocks.values():
             if s.status != "IDLE":
                 continue
             if s.ltp <= 0:
-                logger.debug(f"FILTERED {s.symbol}: LTP<=0 (ltp={s.ltp})")
+                if debug:
+                    logger.debug("FILTERED %s: LTP<=0 (ltp=%s)", s.symbol, s.ltp)
                 continue
             if s.turnover < min_turnover:
-                logger.debug(
-                    f"FILTERED {s.symbol}: Turnover below threshold "
-                    f"(turnover={s.turnover:.0f}, min={min_turnover:.0f})"
-                )
+                if debug:
+                    logger.debug(
+                        "FILTERED %s: Turnover below threshold (turnover=%.0f, min=%.0f)",
+                        s.symbol,
+                        float(s.turnover),
+                        float(min_turnover),
+                    )
                 continue
             idle_stocks.append(s)
 
@@ -1610,7 +1953,7 @@ class LadderEngine:
         self._maybe_emit_movers_diagnostics(source="ws_select_top_movers")
         
         if not idle_stocks:
-            logger.info("No eligible idle stocks after turnover/LTP filters")
+            logger.debug("No eligible idle stocks after turnover/LTP filters")
             return
             
         try:
@@ -1634,15 +1977,24 @@ class LadderEngine:
                     return ((open_px - float(s.prev_close)) / float(s.prev_close)) * 100.0
             return 0.0
 
-        long_candidates = [s for s in idle_stocks if s.change_pct > 0 and _gap_pct(s) <= max_gap_long]
-        short_candidates = [s for s in idle_stocks if s.change_pct < 0 and _gap_pct(s) >= min_gap_short]
+        long_candidates = [
+            s for s in idle_stocks if s.change_pct > 0 and _gap_pct(s) <= max_gap_long
+        ]
+        short_candidates = [
+            s for s in idle_stocks if s.change_pct < 0 and _gap_pct(s) >= min_gap_short
+        ]
 
-        # Sort by % Change
-        long_candidates.sort(key=lambda x: x.change_pct, reverse=True)
-        short_candidates.sort(key=lambda x: x.change_pct)  # Most negative first
-
-        top_gainers = long_candidates[:need_longs] if need_longs > 0 else []
-        top_losers = short_candidates[:need_shorts] if need_shorts > 0 else []
+        # Partial selection (avoid full sort on large candidate sets)
+        top_gainers = (
+            heapq.nlargest(need_longs, long_candidates, key=lambda x: x.change_pct)
+            if need_longs > 0
+            else []
+        )
+        top_losers = (
+            heapq.nsmallest(need_shorts, short_candidates, key=lambda x: x.change_pct)
+            if need_shorts > 0
+            else []
+        )
 
         if top_gainers:
             logger.info(

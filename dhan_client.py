@@ -9,6 +9,7 @@ import requests
 import io
 import threading
 import asyncio
+import websockets
 from functools import lru_cache
 from collections import deque
 from pathlib import Path
@@ -185,6 +186,16 @@ class DhanClientWrapper:
         self.ws_thread = None
         self._ws_stop = threading.Event()
         self._ws_lock = threading.Lock()
+
+        # Live Order Update WebSocket
+        self._order_ws_thread = None
+        self._order_ws_stop = threading.Event()
+        self._order_ws_lock = threading.Lock()
+        self._order_ws_loop = None
+        self._order_ws = None
+        self._order_update_callback = None
+        self._order_update_connected = False
+
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 10
         self.reconnect_delay = 5
@@ -211,6 +222,110 @@ class DhanClientWrapper:
         # Security master cache (avoid re-downloading CSV on every run)
         self._security_master_cache_path = Path(__file__).resolve().parent / "security_master_nse_eq_cache.json"
         self._security_master_cache_max_age_days = 7
+
+    def set_order_update_callback(self, callback):
+        """Register callback to receive raw order-update payloads (dict)."""
+        self._order_update_callback = callback
+
+    def start_order_updates(self):
+        """Start Dhan Live Order Update WebSocket in a background thread."""
+        if not self.is_connected or not self.client_id or not self.access_token:
+            return
+
+        with self._order_ws_lock:
+            if self._order_ws_thread and self._order_ws_thread.is_alive():
+                return
+            self._order_ws_stop.clear()
+            self._order_update_connected = False
+
+            def _run_thread():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                self._order_ws_loop = loop
+                try:
+                    loop.run_until_complete(self._order_ws_run())
+                finally:
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
+                    self._order_ws_loop = None
+
+            self._order_ws_thread = threading.Thread(
+                target=_run_thread,
+                name="dhan-order-updates",
+                daemon=True,
+            )
+            self._order_ws_thread.start()
+
+    def stop_order_updates(self):
+        """Stop order update websocket and prevent reconnection attempts."""
+        self._order_ws_stop.set()
+
+        loop = self._order_ws_loop
+        ws = self._order_ws
+        if loop and ws:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(ws.close(), loop)
+                fut.result(timeout=1)
+            except Exception:
+                pass
+
+        t = self._order_ws_thread
+        if t and t.is_alive():
+            try:
+                t.join(timeout=1)
+            except Exception:
+                pass
+        self._order_ws_thread = None
+        self._order_ws = None
+        self._order_update_connected = False
+
+    async def _order_ws_run(self):
+        """Async loop that connects and consumes Dhan order updates."""
+        backoff = 1.0
+        url = "wss://api-order-update.dhan.co"
+        auth_message = {
+            "LoginReq": {
+                "MsgCode": 42,
+                "ClientId": str(self.client_id),
+                "Token": str(self.access_token),
+            },
+            "UserType": "SELF",
+        }
+
+        while not self._order_ws_stop.is_set():
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as websocket:
+                    self._order_ws = websocket
+                    await websocket.send(json.dumps(auth_message))
+                    self._order_update_connected = True
+                    backoff = 1.0
+
+                    async for message in websocket:
+                        if self._order_ws_stop.is_set():
+                            break
+                        try:
+                            data = json.loads(message)
+                        except Exception:
+                            continue
+
+                        cb = self._order_update_callback
+                        if cb:
+                            try:
+                                cb(data)
+                            except Exception as e:
+                                logger.error(f"Order update callback error: {e}", exc_info=True)
+            except Exception as e:
+                self._order_update_connected = False
+                if self._order_ws_stop.is_set():
+                    break
+                logger.warning(f"Order update websocket disconnected: {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2.0, 30.0)
+            finally:
+                self._order_ws = None
+                self._order_update_connected = False
 
     @staticmethod
     def _extract_client_id_from_token(access_token: str):
@@ -265,6 +380,9 @@ class DhanClientWrapper:
             # Build reverse mapping for fast lookups (only if we have data)
             if self.symbol_map and not self.id_map:
                 self._build_reverse_mapping()
+
+            # Start Live Order Updates WebSocket (instant order status/fill updates)
+            self.start_order_updates()
             
             return True, "Connected"
         except Exception as e:
@@ -597,6 +715,7 @@ class DhanClientWrapper:
     def stop_feed(self):
         """Stop websocket feed and prevent reconnection attempts."""
         self._ws_stop.set()
+        self.stop_order_updates()
 
     def _handle_reconnect(self):
         """Handle WebSocket reconnection with exponential backoff."""
@@ -873,7 +992,15 @@ class DhanClientWrapper:
             )
             
             latency_ms = (time.time() - start_time) * 1000
-            logger.info(f"Order Placed in {latency_ms:.2f}ms: {symbol} {transaction_type} {quantity} -> {response}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Order placed in %.2fms: %s %s %s -> %s",
+                    latency_ms,
+                    symbol,
+                    transaction_type,
+                    quantity,
+                    response,
+                )
             
             return response
             
