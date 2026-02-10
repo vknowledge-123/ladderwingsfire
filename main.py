@@ -131,11 +131,11 @@ async def startup_event():
             logger.error(f"Warmup: filtered stocks load failed: {e}")
 
     async def _auto_start_at_market_open():
-        """Arm and start engine right at 09:15 IST if configured/armed."""
+        """Arm and start engine right at 09:16 IST if configured/armed."""
         while True:
             try:
                 now = datetime.now(IST)
-                open_dt = now.replace(hour=9, minute=15, second=0, microsecond=0)
+                open_dt = now.replace(hour=9, minute=16, second=0, microsecond=0)
                 if now >= open_dt:
                     # If already past market open, check again later.
                     await asyncio.sleep(60)
@@ -167,7 +167,7 @@ async def startup_event():
                     logger.error("Auto-start: No filtered stocks available at market open")
                     continue
 
-                logger.info("Auto-start: Starting engine at market open (09:15 IST)")
+                logger.info("Auto-start: Starting engine at market open (09:16 IST)")
                 engine.armed_for_market_open = False
                 asyncio.create_task(engine.start_strategy())
             except Exception as e:
@@ -285,7 +285,7 @@ async def start_engine():
             engine.armed_for_market_open = True
             return {
                 "status": "armed",
-                "message": "Market closed (IST). Engine armed; will auto-start at 09:15 IST.",
+                "message": "Market closed (IST). Engine armed; will auto-start at 09:16 IST.",
             }
 
         # Ensure we have candidates, otherwise the engine will start and immediately stop.

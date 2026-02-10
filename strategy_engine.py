@@ -440,6 +440,13 @@ class LadderEngine:
 
     def _place_market_order(self, symbol: str, transaction_type: str, qty: int, price: float):
         """Place a market order and record in OrderManager (runs in worker thread)."""
+        if not self.is_market_hours():
+            # Extra safety: never place orders before trade start time / after market close.
+            logger.warning(
+                f"Order blocked outside market hours (IST): {symbol} {transaction_type} qty={qty}"
+            )
+            return {"status": "failure", "message": "Order blocked: outside market hours (IST)"}, None, 0.0, 0
+
         with self._order_manager_lock:
             order = self.order_manager.create_order(
                 symbol=symbol,
@@ -847,7 +854,7 @@ class LadderEngine:
     def is_market_hours(self) -> bool:
         """Check if current time is within market hours."""
         now = datetime.now(IST).time()
-        market_open = dt_time(9, 15)
+        market_open = dt_time(9, 16)
         market_close = dt_time(15, 30)  # Market closes at 3:30 PM
         return market_open <= now <= market_close
 
