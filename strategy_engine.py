@@ -13,7 +13,7 @@ from order_manager import OrderManager
 from performance_monitor import perf_monitor
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Iterable, Tuple
+from typing import Dict, List, Iterable, Tuple, Optional, Any
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 from redis_store import load_candidates
@@ -298,6 +298,146 @@ class LadderEngine:
     def _clear_pending(self, stock: StockStatus):
         stock.pending_order = ""
 
+    @staticmethod
+    def _match_position_symbol(pos_symbol: Any, symbol: str) -> bool:
+        try:
+            ps = str(pos_symbol or "").strip().upper()
+            sym = str(symbol or "").strip().upper()
+        except Exception:
+            return False
+        if not ps or not sym:
+            return False
+        if ps == sym:
+            return True
+        # Some brokers include series suffixes like "TCS-EQ"
+        if ps.startswith(sym + "-"):
+            return True
+        if ps.endswith("-EQ") and ps[:-3] == sym:
+            return True
+        return False
+
+    @staticmethod
+    def _coerce_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(float(value))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _get_broker_position_snapshot(self, symbol: str) -> Optional[dict]:
+        """
+        Best-effort normalize broker position fields used to infer executed prices.
+        Expected keys (when available):
+          - buy_qty, sell_qty (int)
+          - buy_avg, sell_avg (float)
+        """
+        try:
+            if not getattr(self.dhan_client, "is_connected", False):
+                return None
+            positions = self.dhan_client.get_positions() or []
+        except Exception:
+            return None
+
+        if not isinstance(positions, list):
+            return None
+
+        row = None
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            ps = (
+                p.get("tradingSymbol")
+                or p.get("trading_symbol")
+                or p.get("tradingsymbol")
+                or p.get("symbol")
+                or p.get("Symbol")
+            )
+            if self._match_position_symbol(ps, symbol):
+                row = p
+                break
+        if row is None:
+            return None
+
+        def pick_int(*keys: str) -> int:
+            for k in keys:
+                if k in row and row.get(k) is not None:
+                    v = self._coerce_int(row.get(k))
+                    if v is not None:
+                        return v
+            return 0
+
+        def pick_float(*keys: str) -> float:
+            for k in keys:
+                if k in row and row.get(k) is not None:
+                    v = self._coerce_float(row.get(k))
+                    if v is not None:
+                        return v
+            return 0.0
+
+        snap = {
+            "buy_qty": pick_int("buyQty", "buy_qty", "buyQuantity", "buy_quantity", "totalBuyQty", "total_buy_qty"),
+            "sell_qty": pick_int("sellQty", "sell_qty", "sellQuantity", "sell_quantity", "totalSellQty", "total_sell_qty"),
+            "buy_avg": pick_float("buyAvg", "buyAvgPrice", "buy_avg", "buy_average_price", "avgBuyPrice", "avg_buy_price"),
+            "sell_avg": pick_float("sellAvg", "sellAvgPrice", "sell_avg", "sell_average_price", "avgSellPrice", "avg_sell_price"),
+        }
+        return snap
+
+    @staticmethod
+    def _infer_incremental_fill(before: Optional[dict], after: Optional[dict], transaction_type: str) -> Optional[tuple[float, int]]:
+        """Infer incremental avg fill price/qty from before/after broker position snapshots."""
+        if not after:
+            return None
+        tx = str(transaction_type or "").upper()
+        if tx not in ("BUY", "SELL"):
+            return None
+
+        qty_key = "buy_qty" if tx == "BUY" else "sell_qty"
+        avg_key = "buy_avg" if tx == "BUY" else "sell_avg"
+
+        bq = int((before or {}).get(qty_key) or 0)
+        ba = float((before or {}).get(avg_key) or 0.0)
+        aq = int(after.get(qty_key) or 0)
+        aa = float(after.get(avg_key) or 0.0)
+
+        delta_qty = aq - bq
+        if delta_qty <= 0:
+            return None
+        # Weighted-average delta: (avg*qty) is total value
+        delta_value = (aa * aq) - (ba * bq)
+        if delta_value <= 0:
+            # If broker doesn't provide avg fields, fall back to unknown.
+            return None
+        return (delta_value / float(delta_qty), int(delta_qty))
+
+    def _wait_for_broker_fill(self, symbol: str, transaction_type: str, before: Optional[dict], qty_hint: int) -> Optional[tuple[float, int]]:
+        """
+        Poll broker positions briefly and infer executed price/qty for the latest order.
+        Falls back to None if positions are unavailable/not updated in time.
+        """
+        # Keep this short: runs on order worker threads.
+        deadline = time.time() + 2.0
+        best: Optional[tuple[float, int]] = None
+        while time.time() < deadline:
+            after = self._get_broker_position_snapshot(symbol)
+            fill = self._infer_incremental_fill(before, after, transaction_type)
+            if fill:
+                best = fill
+                # If we already saw at least requested qty (or more), stop early.
+                if fill[1] >= max(1, int(qty_hint or 0)):
+                    return fill
+            time.sleep(0.2)
+        return best
+
     def _place_market_order(self, symbol: str, transaction_type: str, qty: int, price: float):
         """Place a market order and record in OrderManager (runs in worker thread)."""
         with self._order_manager_lock:
@@ -308,6 +448,7 @@ class LadderEngine:
                 order_type="MARKET",
             )
 
+        pos_before = self._get_broker_position_snapshot(symbol)
         start_time = time.time()
         resp = self.dhan_client.place_order(
             symbol=symbol,
@@ -320,20 +461,40 @@ class LadderEngine:
         perf_monitor.record_order_latency((time.time() - start_time) * 1000)
 
         if resp and resp.get("status") == "failure":
-            return resp, None
+            try:
+                # Keep OrderManager consistent for UI/debugging.
+                with self._order_manager_lock:
+                    if order:
+                        self.order_manager.update_order_status(
+                            order.order_id,
+                            "REJECTED",
+                            executed_price=0.0,
+                            executed_quantity=0,
+                            error_message=str(resp),
+                        )
+            except Exception:
+                pass
+            return resp, None, 0.0, 0
 
         order_id = None
+        executed_price = float(price or 0.0)
+        executed_qty = int(qty or 0)
         if resp:
-            order_id = str(resp.get("orderId", order.order_id))
+            fallback_id = order.order_id if order else f"TEMP_{symbol}_{int(time.time() * 1000)}"
+            order_id = str(resp.get("orderId", fallback_id))
+            inferred = self._wait_for_broker_fill(symbol, transaction_type, pos_before, qty_hint=qty)
+            if inferred:
+                executed_price, executed_qty = float(inferred[0]), int(inferred[1])
             with self._order_manager_lock:
-                self.order_manager.replace_order_id(order.order_id, order_id)
-                self.order_manager.update_order_status(
-                    order_id,
-                    "EXECUTED",
-                    executed_price=price,
-                    executed_quantity=qty,
-                )
-        return resp, order_id
+                if order:
+                    self.order_manager.replace_order_id(order.order_id, order_id)
+                    self.order_manager.update_order_status(
+                        order_id,
+                        "EXECUTED",
+                        executed_price=executed_price,
+                        executed_quantity=executed_qty,
+                    )
+        return resp, order_id, executed_price, executed_qty
 
     def _execute_order_task(self, task: dict):
         kind = task.get("kind")
@@ -368,7 +529,7 @@ class LadderEngine:
         if kind == "START_LONG":
             qty = int(task.get("qty") or 0)
             price = float(task.get("price") or 0.0)
-            resp, order_id = self._place_market_order(symbol, "BUY", qty, price)
+            resp, order_id, exec_price, exec_qty = self._place_market_order(symbol, "BUY", qty, price)
             with lock:
                 stock = self.active_stocks.get(symbol)
                 if not stock or stock.pending_order != expected_pending:
@@ -388,24 +549,26 @@ class LadderEngine:
                 if order_id:
                     stock.order_ids.append(str(order_id))
 
+                fill_price = float(exec_price or price or 0.0)
+                fill_qty = int(exec_qty or qty or 0)
                 stock.mode = "LONG"
                 stock.status = "ACTIVE"
                 stock.ladder_level = 1
-                stock.entry_price = price
-                stock.avg_entry_price = price
-                stock.quantity = qty
-                stock.high_watermark = price
+                stock.entry_price = fill_price
+                stock.avg_entry_price = fill_price
+                stock.quantity = fill_qty
+                stock.high_watermark = fill_price
 
-                stock.stop_loss = price * (1 - self.init_sl_mult)
-                stock.target = price * (1 + self.target_mult)
-                stock.next_add_on = price * (1 + self.add_on_mult)
+                stock.stop_loss = fill_price * (1 - self.init_sl_mult)
+                stock.target = fill_price * (1 + self.target_mult)
+                stock.next_add_on = fill_price * (1 + self.add_on_mult)
                 self._clear_pending(stock)
             return
 
         if kind == "START_SHORT":
             qty = int(task.get("qty") or 0)
             price = float(task.get("price") or 0.0)
-            resp, order_id = self._place_market_order(symbol, "SELL", qty, price)
+            resp, order_id, exec_price, exec_qty = self._place_market_order(symbol, "SELL", qty, price)
             with lock:
                 stock = self.active_stocks.get(symbol)
                 if not stock or stock.pending_order != expected_pending:
@@ -425,17 +588,19 @@ class LadderEngine:
                 if order_id:
                     stock.order_ids.append(str(order_id))
 
+                fill_price = float(exec_price or price or 0.0)
+                fill_qty = int(exec_qty or qty or 0)
                 stock.mode = "SHORT"
                 stock.status = "ACTIVE"
                 stock.ladder_level = 1
-                stock.entry_price = price
-                stock.avg_entry_price = price
-                stock.quantity = qty
-                stock.high_watermark = price
+                stock.entry_price = fill_price
+                stock.avg_entry_price = fill_price
+                stock.quantity = fill_qty
+                stock.high_watermark = fill_price
 
-                stock.stop_loss = price * (1 + self.init_sl_mult)
-                stock.target = price * (1 - self.target_mult)
-                stock.next_add_on = price * (1 - self.add_on_mult)
+                stock.stop_loss = fill_price * (1 + self.init_sl_mult)
+                stock.target = fill_price * (1 - self.target_mult)
+                stock.next_add_on = fill_price * (1 - self.add_on_mult)
                 self._clear_pending(stock)
             return
 
@@ -444,7 +609,7 @@ class LadderEngine:
             qty = int(task.get("qty") or 0)
             price = float(task.get("price") or 0.0)
             transaction_type = "BUY" if mode == "LONG" else "SELL"
-            resp, order_id = self._place_market_order(symbol, transaction_type, qty, price)
+            resp, order_id, exec_price, exec_qty = self._place_market_order(symbol, transaction_type, qty, price)
             with lock:
                 stock = self.active_stocks.get(symbol)
                 if not stock or stock.pending_order != expected_pending:
@@ -457,21 +622,32 @@ class LadderEngine:
                 if order_id:
                     stock.order_ids.append(str(order_id))
 
+                fill_price = float(exec_price or price or 0.0)
+                fill_qty = int(exec_qty or qty or 0)
                 prev_qty = stock.quantity
-                stock.quantity += qty
-                stock.ladder_level += 1
+                stock.quantity += fill_qty
+                stock.ladder_level += 1 if fill_qty > 0 else 0
 
                 if prev_qty > 0 and stock.avg_entry_price > 0:
                     stock.avg_entry_price = (
-                        (stock.avg_entry_price * prev_qty) + (price * qty)
+                        (stock.avg_entry_price * prev_qty) + (fill_price * fill_qty)
                     ) / stock.quantity
                 else:
-                    stock.avg_entry_price = price
+                    stock.avg_entry_price = fill_price
 
                 if mode == "LONG":
-                    stock.next_add_on = price * (1 + self.add_on_mult)
+                    stock.next_add_on = fill_price * (1 + self.add_on_mult)
+                    # Keep SL/target aligned to executed (avg) price; never loosen SL.
+                    init_sl = stock.avg_entry_price * (1 - self.init_sl_mult)
+                    if init_sl > stock.stop_loss:
+                        stock.stop_loss = init_sl
+                    stock.target = stock.avg_entry_price * (1 + self.target_mult)
                 else:
-                    stock.next_add_on = price * (1 - self.add_on_mult)
+                    stock.next_add_on = fill_price * (1 - self.add_on_mult)
+                    init_sl = stock.avg_entry_price * (1 + self.init_sl_mult)
+                    if stock.stop_loss == 0 or init_sl < stock.stop_loss:
+                        stock.stop_loss = init_sl
+                    stock.target = stock.avg_entry_price * (1 - self.target_mult)
 
                 self._clear_pending(stock)
             return
@@ -481,7 +657,7 @@ class LadderEngine:
             qty = int(task.get("qty") or 0)
             price = float(task.get("price") or 0.0)
             final_status = task.get("final_status") or "CLOSED"
-            resp, order_id = self._place_market_order(symbol, transaction_type, qty, price)
+            resp, order_id, _, _ = self._place_market_order(symbol, transaction_type, qty, price)
             with lock:
                 stock = self.active_stocks.get(symbol)
                 if not stock or stock.pending_order != expected_pending:
@@ -502,65 +678,68 @@ class LadderEngine:
             return
 
         if kind == "CLOSE_AND_FLIP":
-            close_tx = task.get("close_transaction_type")
+            reverse_tx = task.get("reverse_transaction_type") or task.get("close_transaction_type")
             close_qty = int(task.get("close_qty") or 0)
-            close_price = float(task.get("close_price") or 0.0)
+            reverse_qty = int(task.get("reverse_qty") or 0)
             flip_to = task.get("flip_to")
             open_qty = int(task.get("open_qty") or 0)
-            open_price = float(task.get("open_price") or 0.0)
+            price = float(task.get("price") or task.get("close_price") or task.get("open_price") or 0.0)
             cycle_index_next = task.get("cycle_index_next")
 
-            resp_close, order_id_close = self._place_market_order(symbol, close_tx, close_qty, close_price)
-            if resp_close and resp_close.get("status") == "failure":
-                with lock:
-                    stock = self.active_stocks.get(symbol)
-                    if stock and stock.pending_order == expected_pending:
-                        stock.last_order_error = str(resp_close)
-                        stock.status = "ACTIVE"
-                        self._clear_pending(stock)
-                return
+            if reverse_qty <= 0:
+                reverse_qty = close_qty + max(0, open_qty)
 
-            open_tx = "SELL" if flip_to == "SHORT" else "BUY"
-            resp_open, order_id_open = self._place_market_order(symbol, open_tx, open_qty, open_price)
+            resp_rev, order_id_rev, exec_price, exec_qty = self._place_market_order(
+                symbol, reverse_tx, reverse_qty, price
+            )
             with lock:
                 stock = self.active_stocks.get(symbol)
                 if not stock or stock.pending_order != expected_pending:
                     return
 
-                if order_id_close:
-                    stock.order_ids.append(str(order_id_close))
-                if resp_open and resp_open.get("status") == "failure":
-                    stock.last_order_error = str(resp_open)
+                if resp_rev and resp_rev.get("status") == "failure":
+                    stock.last_order_error = str(resp_rev)
+                    stock.status = "ACTIVE"
+                    self._clear_pending(stock)
+                    return
+
+                if order_id_rev:
+                    stock.order_ids.append(str(order_id_rev))
+
+                # Start new ladder in opposite direction (level resets)
+                with self._started_lock:
+                    self.started_symbols.add(symbol)
+
+                fill_price = float(exec_price or price or 0.0)
+                filled_total = int(exec_qty or reverse_qty or 0)
+                filled_open_qty = max(0, filled_total - max(0, close_qty))
+
+                # If we couldn't open the next ladder, keep best-effort stable state.
+                if filled_open_qty <= 0:
+                    stock.last_order_error = "Flip executed without opening new ladder quantity"
                     stock.quantity = 0
                     stock.mode = "NONE"
                     stock.status = "IDLE"
                     self._clear_pending(stock)
                     return
 
-                if order_id_open:
-                    stock.order_ids.append(str(order_id_open))
-
-                # Start new ladder in opposite direction (level resets)
-                with self._started_lock:
-                    self.started_symbols.add(symbol)
-
                 if flip_to == "SHORT":
                     stock.mode = "SHORT"
-                    stock.stop_loss = open_price * (1 + self.init_sl_mult)
-                    stock.target = open_price * (1 - self.target_mult)
-                    stock.next_add_on = open_price * (1 - self.add_on_mult)
+                    stock.stop_loss = fill_price * (1 + self.init_sl_mult)
+                    stock.target = fill_price * (1 - self.target_mult)
+                    stock.next_add_on = fill_price * (1 - self.add_on_mult)
                 else:
                     stock.mode = "LONG"
-                    stock.stop_loss = open_price * (1 - self.init_sl_mult)
-                    stock.target = open_price * (1 + self.target_mult)
-                    stock.next_add_on = open_price * (1 + self.add_on_mult)
+                    stock.stop_loss = fill_price * (1 - self.init_sl_mult)
+                    stock.target = fill_price * (1 + self.target_mult)
+                    stock.next_add_on = fill_price * (1 + self.add_on_mult)
 
                 stock.status = "ACTIVE"
                 stock.ladder_level = 1
-                stock.entry_price = open_price
-                stock.avg_entry_price = open_price
-                stock.quantity = open_qty
-                stock.high_watermark = open_price
+                stock.entry_price = fill_price
+                stock.avg_entry_price = fill_price
+                stock.quantity = filled_open_qty
+                stock.high_watermark = fill_price
                 if cycle_index_next is not None:
                     try:
                         stock.cycle_index = int(cycle_index_next)
@@ -1099,11 +1278,13 @@ class LadderEngine:
 
             close_tx = "SELL" if stock.mode == "LONG" else "BUY"
             close_qty = int(stock.quantity)
-            close_price = float(stock.ltp)
 
-            open_tx = "BUY" if flip_to == "LONG" else "SELL"
+            # Initial quantity for the next ladder (based on current LTP).
             open_qty = max(1, int(self.settings.trade_capital / stock.ltp)) if stock.ltp > 0 else 1
-            open_price = float(stock.ltp)
+            # One reverse order: close existing qty + open initial qty for next ladder.
+            reverse_tx = close_tx
+            reverse_qty = int(close_qty + open_qty)
+            price = float(stock.ltp)
 
             pending = f"CLOSE_AND_FLIP_{flip_to}"
             self._mark_pending(stock, pending)
@@ -1116,11 +1297,11 @@ class LadderEngine:
                 "reason": reason,
                 "close_transaction_type": close_tx,
                 "close_qty": close_qty,
-                "close_price": close_price,
                 "flip_to": flip_to,
-                "open_transaction_type": open_tx,
                 "open_qty": open_qty,
-                "open_price": open_price,
+                "reverse_transaction_type": reverse_tx,
+                "reverse_qty": reverse_qty,
+                "price": price,
                 "cycle_index_next": cycle_index_next,
             }
 
