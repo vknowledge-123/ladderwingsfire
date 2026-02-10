@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import sys
+import os
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -194,12 +195,13 @@ async def startup_event():
                 update={"client_id": saved_client_id, "access_token": saved_access_token}
             )
             engine.update_settings(merged)
-            logger.info("✅ Auto-connected to Dhan using saved credentials")
+            logger.info("Auto-connected to Dhan using saved credentials")
             asyncio.create_task(_warmup())
         else:
             logger.error(f"Auto-connect failed: {msg}")
 
-    asyncio.create_task(_auto_connect_saved())
+    if str(os.getenv("DISABLE_AUTO_CONNECT", "")).strip().lower() not in {"1", "true", "yes", "y", "on"}:
+        asyncio.create_task(_auto_connect_saved())
     asyncio.create_task(_auto_start_at_market_open())
 
 # Routes

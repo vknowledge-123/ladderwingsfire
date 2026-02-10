@@ -9,6 +9,12 @@ from strategy_engine import LadderEngine
 def test_start_order_is_async_and_tick_not_blocked():
     mock_dhan = MagicMock(spec=DhanClientWrapper)
     mock_dhan.is_connected = True
+    order_update_cb = {"cb": None}
+
+    def _set_order_update_callback(cb):
+        order_update_cb["cb"] = cb
+
+    mock_dhan.set_order_update_callback = MagicMock(side_effect=_set_order_update_callback)
 
     call_counter = {"i": 0}
 
@@ -21,6 +27,7 @@ def test_start_order_is_async_and_tick_not_blocked():
 
     engine = LadderEngine(mock_dhan)
     engine.running = True
+    engine.is_market_hours = MagicMock(return_value=True)
     engine.update_settings(StrategySettings(max_concurrent_orders=1, trade_capital=1000.0))
 
     stock = StockStatus(
@@ -55,6 +62,20 @@ def test_start_order_is_async_and_tick_not_blocked():
     # Wait for worker to complete
     deadline = time.time() + 3.0
     while time.time() < deadline:
+        # Simulate Live Order Update websocket fill (TRADED) once order_id is known.
+        if order_update_cb["cb"] is not None and engine.active_stocks["TST"].pending_order == "START_LONG":
+            # The test orderId will be "1" based on our slow_place_order counter.
+            order_update_cb["cb"](
+                {
+                    "Type": "order_alert",
+                    "Data": {
+                        "orderNo": "1",
+                        "status": "TRADED",
+                        "tradedQty": 10,
+                        "avgTradedPrice": 100.0,
+                    },
+                }
+            )
         if engine.active_stocks["TST"].mode == "LONG" and engine.active_stocks["TST"].pending_order == "":
             break
         time.sleep(0.05)
@@ -66,4 +87,3 @@ def test_start_order_is_async_and_tick_not_blocked():
 if __name__ == "__main__":
     test_start_order_is_async_and_tick_not_blocked()
     print("OK")
-

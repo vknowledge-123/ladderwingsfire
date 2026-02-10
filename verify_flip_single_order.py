@@ -30,7 +30,7 @@ def test_close_and_flip_uses_single_reverse_order_and_sets_next_qty():
     engine.active_stocks = {stock.symbol: stock}
 
     engine._place_market_order = MagicMock(
-        return_value=({"status": "success", "orderId": "OID1"}, "OID1", 101.25, 400)
+        return_value=({"status": "success", "orderId": "OID1"}, "OID1", 0.0, 0)
     )
 
     task = {
@@ -57,6 +57,19 @@ def test_close_and_flip_uses_single_reverse_order_and_sets_next_qty():
     assert called_args[1] == "SELL"
     assert called_args[2] == 400
 
+    # Simulate Live Order Update websocket fill (TRADED) for the reverse order.
+    engine.on_order_update(
+        {
+            "Type": "order_alert",
+            "Data": {
+                "orderNo": "OID1",
+                "status": "TRADED",
+                "tradedQty": 400,
+                "avgTradedPrice": 101.25,
+            },
+        }
+    )
+
     assert stock.mode == "SHORT"
     assert stock.quantity == 100
     assert stock.entry_price == 101.25
@@ -65,35 +78,26 @@ def test_close_and_flip_uses_single_reverse_order_and_sets_next_qty():
     assert stock.pending_order == ""
 
 
-def test_place_market_order_inferrs_executed_price_from_positions():
+def test_place_market_order_does_not_poll_positions_for_fill():
     mock_dhan = MagicMock(spec=DhanClientWrapper)
     mock_dhan.is_connected = True
 
-    before = [{"tradingSymbol": "TST", "buyQty": 100, "buyAvg": 100.0, "sellQty": 0, "sellAvg": 0.0}]
-    after = [{"tradingSymbol": "TST", "buyQty": 150, "buyAvg": 101.0, "sellQty": 0, "sellAvg": 0.0}]
-
-    calls = {"n": 0}
-
-    def get_positions_side_effect():
-        calls["n"] += 1
-        return before if calls["n"] == 1 else after
-
-    mock_dhan.get_positions = MagicMock(side_effect=get_positions_side_effect)
+    # Must not be called (we no longer infer fills via polling positions).
+    mock_dhan.get_positions = MagicMock(side_effect=RuntimeError("get_positions should not be called"))
     mock_dhan.place_order = MagicMock(return_value={"status": "success", "orderId": "OID2"})
 
     engine = LadderEngine(mock_dhan)
+    engine.is_market_hours = MagicMock(return_value=True)
     resp, order_id, exec_price, exec_qty = engine._place_market_order("TST", "BUY", 50, 100.5)
 
     assert resp.get("status") == "success"
     assert order_id == "OID2"
-    assert exec_qty == 50
-    # From before->after: delta value = (101*150) - (100*100) = 5150; delta qty=50 => 103.0
-    # But buyAvg in 'after' is 101.0; expected fill price computed by delta -> 103.0
-    assert abs(exec_price - 103.0) < 1e-6
+    assert exec_qty == 0
+    assert exec_price == 0.0
+    assert mock_dhan.get_positions.call_count == 0
 
 
 if __name__ == "__main__":
     test_close_and_flip_uses_single_reverse_order_and_sets_next_qty()
-    test_place_market_order_inferrs_executed_price_from_positions()
+    test_place_market_order_does_not_poll_positions_for_fill()
     print("OK")
-

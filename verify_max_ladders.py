@@ -22,6 +22,7 @@ def test_max_ladder_stocks_limits_new_starts():
 
     engine = LadderEngine(mock_dhan)
     engine.running = True
+    engine.is_market_hours = MagicMock(return_value=True)
     engine.update_settings(
         StrategySettings(
             max_ladder_stocks=20,
@@ -84,6 +85,23 @@ def test_max_ladder_stocks_limits_new_starts():
     # Wait for async workers to execute queued orders
     deadline = time.time() + 5.0
     while time.time() < deadline:
+        # Simulate Live Order Update websocket fills for any placed orders.
+        try:
+            pending_items = list(getattr(engine, "_pending_broker_actions", {}).items())
+        except Exception:
+            pending_items = []
+        for oid, action in pending_items:
+            engine.on_order_update(
+                {
+                    "Type": "order_alert",
+                    "Data": {
+                        "orderNo": str(oid),
+                        "status": "TRADED",
+                        "tradedQty": int(action.get("qty") or 0),
+                        "avgTradedPrice": float(action.get("price") or 100.0),
+                    },
+                }
+            )
         active_positions = [s for s in engine.active_stocks.values() if s.mode != "NONE"]
         if len(active_positions) == 20:
             break
