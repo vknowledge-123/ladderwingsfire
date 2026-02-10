@@ -39,7 +39,7 @@ root_logger.handlers = [handler]
 logger = logging.getLogger(__name__)
 
 # Filtration criteria
-VOLUME_SMA_THRESHOLD = 2000
+VOLUME_SMA_THRESHOLD = 50
 VOLUME_SMA_DIVISOR = 1875
 REQUIRED_DAYS = 5
 

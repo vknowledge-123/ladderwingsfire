@@ -21,12 +21,12 @@ class StrategySettings(BaseModel):
     auto_start_market_open: bool = True
 
     # Entry Filters / Cycles
-    max_open_gap_pct_long: float = 3.0
-    min_open_gap_pct_short: float = -3.0
+    max_open_gap_pct_long: float = 5.0
+    min_open_gap_pct_short: float = -5.0
     cycles_per_stock: int = 3
     
     # Risk Management
-    trade_capital: float = 5000.0
+    trade_capital: float = 1000.0
     profit_target_per_stock: float = 5000.0
     loss_limit_per_stock: float = 2000.0
     global_profit_exit: float = 4000.0
